@@ -1,6 +1,7 @@
-//! The AVX-512 compressor: it walks the input 64 bytes at a time with a zero mask, and
-//! skips 256 bytes at a time inside long zero runs and long literals. It writes exactly
-//! the bytes of [`crate::scalar::compress`].
+//! The AVX-512 compressor: it looks for aligned zero lanes 64 bytes at a time with one
+//! compare per vector, and skips 256 bytes at a time inside long zero runs and long
+//! literals. It writes exactly the bytes of [`crate::scalar::compress`], and
+//! [`compress_aligned`] those of [`crate::scalar::compress_aligned`].
 
 mod decompress;
 mod ops;
@@ -9,9 +10,8 @@ pub use decompress::decompress;
 
 use std::arch::x86_64::*;
 
-use crate::block::{block_len, write_block};
-use crate::{MIN_ZERO_RUN, escape_len, scalar};
-use ops::{has_zero_run_256, is_zero_256, zero_mask_tail};
+use crate::runs::{self, LaneWidth};
+use ops::{has_zero_lane_256, is_zero_256, load_tail, zero_lane_mask};
 
 /// Returns whether the CPU has every feature [`compress`] and [`decompress`] enable.
 ///
@@ -20,7 +20,9 @@ use ops::{has_zero_run_256, is_zero_256, zero_mask_tail};
 /// `true` if it has AVX-512F, AVX-512BW and BMI2.
 pub fn is_supported() -> bool {
     // std caches the CPUID results: each check is a load and a test.
-    is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("bmi2")
+    is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("bmi2")
 }
 
 /// Compresses bytes, 64 at a time with AVX-512.
@@ -29,6 +31,7 @@ pub fn is_supported() -> bool {
 ///
 /// * `src` - The input.
 /// * `dst` - Where the blocks go, at least [`crate::compress_bound`] of the input.
+/// * `min_zero_run` - The shortest run left out, at least [`crate::MIN_ZERO_RUN`].
 ///
 /// # Returns
 ///
@@ -36,198 +39,278 @@ pub fn is_supported() -> bool {
 ///
 /// # Panics
 ///
-/// Panics if `dst` is shorter than [`crate::compress_bound`].
+/// Panics if `dst` is shorter than [`crate::compress_bound`], or `min_zero_run` is below
+/// [`crate::MIN_ZERO_RUN`].
 ///
 /// # Safety
 ///
 /// The CPU must have AVX-512F, AVX-512BW and BMI2: see [`is_supported`].
 #[target_feature(enable = "avx512f,avx512bw,bmi2")]
-pub fn compress(src: &[u8], dst: &mut [u8]) -> usize {
-    let src_len = src.len();
-    if src_len < 64 {
-        // Not one whole word: the vector setup doesn't pay.
-        return scalar::compress(src, dst);
+pub fn compress(src: &[u8], dst: &mut [u8], min_zero_run: usize) -> usize {
+    // The closures inherit this function's target features, so the scanners inline into
+    // runs::compress, which inlines here.
+    match LaneWidth::for_min_zero_run(min_zero_run) {
+        LaneWidth::Two => runs::compress::<2>(
+            src,
+            dst,
+            min_zero_run,
+            |src, position| find_zero_lane::<2>(src, position),
+            runs::zeros_before_lane::<2>,
+            |src, position| end_of_zeros(src, position),
+        ),
+        LaneWidth::Four => runs::compress::<4>(
+            src,
+            dst,
+            min_zero_run,
+            |src, position| find_zero_lane::<4>(src, position),
+            runs::zeros_before_lane::<4>,
+            |src, position| end_of_zeros(src, position),
+        ),
+        LaneWidth::Eight => runs::compress::<8>(
+            src,
+            dst,
+            min_zero_run,
+            |src, position| find_zero_lane::<8>(src, position),
+            runs::zeros_before_lane::<8>,
+            |src, position| end_of_zeros(src, position),
+        ),
     }
+}
 
-    // The end of the last whole 64-byte word.
-    let full = src_len / 64 * 64;
-    let zero = _mm512_setzero_si512();
+/// Compresses bytes by the aligned rule of [`crate::compress_aligned`], 64 at a time with
+/// AVX-512.
+///
+/// # Arguments
+///
+/// * `src` - The input.
+/// * `dst` - Where the blocks go, at least [`crate::compress_bound`] of the input.
+/// * `min_zero_words` - The fewest zero words a run has, at least [`crate::MIN_ZERO_WORDS`].
+///
+/// # Returns
+///
+/// How many bytes were written; the same bytes as [`crate::scalar::compress_aligned`].
+///
+/// # Panics
+///
+/// Panics if `dst` is shorter than [`crate::compress_bound`], or `min_zero_words` is below
+/// [`crate::MIN_ZERO_WORDS`].
+///
+/// # Safety
+///
+/// The CPU must have AVX-512F, AVX-512BW and BMI2: see [`is_supported`].
+#[target_feature(enable = "avx512f,avx512bw,bmi2")]
+pub fn compress_aligned(src: &[u8], dst: &mut [u8], min_zero_words: usize) -> usize {
+    // A zero lane of 8 is a zero word: find_zero_lane::<8> finds the next one.
+    runs::compress::<8>(
+        src,
+        dst,
+        runs::min_zero_run_of_words(min_zero_words),
+        |src, position| find_zero_lane::<8>(src, position),
+        runs::zeros_before_word,
+        |src, position| end_of_zero_words(src, position),
+    )
+}
 
-    // Where the current literal starts in `src`, and how many bytes it holds so far.
-    let mut literal_start = 0;
-    let mut literal_len: usize = 0;
-    // Zeros seen right after the literal, not yet known to be a run (3 or more).
-    let mut zero_len: usize = 0;
-    let mut written = 0;
-
-    // Offset in `src` of the next word to load.
-    let mut next_word = 0;
-    // The current word's mask: bit i set where byte i is zero, shifted so that bit 0 is the
-    // next byte to look at.
-    let mut zero_mask: u64 = 0;
-    // How many bytes of the current word are still to look at.
-    let mut remaining_bytes = 0;
-
-    loop {
-        // Refill: when the current word is used up, load the next one.
-        if remaining_bytes == 0 {
-            if next_word == src_len {
+/// Returns where the next aligned zero lane is, 64 bytes at a time.
+///
+/// # Arguments
+///
+/// * `LANE` - The lane width in bytes: 2, 4 or 8.
+/// * `src` - The bytes.
+/// * `position` - Where to start looking: a multiple of `LANE`, possibly past the end.
+///
+/// # Returns
+///
+/// The first multiple of `LANE` at or after `position` where `LANE` zero bytes start, all
+/// inside `src`; `src.len()` if there is none.
+#[target_feature(enable = "avx512f,avx512bw,bmi2")]
+fn find_zero_lane<const LANE: usize>(src: &[u8], mut position: usize) -> usize {
+    let src_len = src.len();
+    // `position` stays a multiple of LANE, so the lanes of every vector are aligned too.
+    while position + 64 <= src_len {
+        // SAFETY: position + 64 <= src_len, so the 64 bytes are in `src`.
+        let vector = unsafe { _mm512_loadu_si512(src.as_ptr().add(position).cast()) };
+        let lanes = zero_lane_mask::<LANE>(vector);
+        if lanes != 0 {
+            return position + lanes.trailing_zeros() as usize * LANE;
+        }
+        position += 64;
+        // A whole vector without a zero lane: likely a long literal, so skip ahead 256
+        // bytes at a time while none holds one.
+        while position + 256 <= src_len {
+            let block: &[u8; 256] = src[position..position + 256].try_into().unwrap();
+            if has_zero_lane_256::<LANE>(block) {
                 break;
             }
-            if next_word < full {
-                // SAFETY: next_word + 64 <= full <= src_len, so the 64 bytes are in `src`.
-                let word = unsafe { _mm512_loadu_si512(src.as_ptr().add(next_word).cast()) };
-                zero_mask = _mm512_cmpeq_epi8_mask(word, zero);
-                remaining_bytes = 64;
-                next_word += 64;
-            } else {
-                // The last partial word, 1 to 63 bytes: a masked load reads none past the
-                // end, and the mask's bits past the end are clear, so the stretches below
-                // stop at the input's end.
-                zero_mask = zero_mask_tail(&src[full..]);
-                remaining_bytes = src_len - full;
-                next_word = src_len;
-            }
-        }
-
-        // Take one stretch: the zeros at the bottom of the mask, or the literal bytes up to
-        // the next place a run may start.
-        let is_zero_stretch = zero_mask & 1 == 1;
-        let stretch = if is_zero_stretch {
-            // The bits above the word are 0 after the shifts, so this stops at its end.
-            zero_mask.trailing_ones() as usize
-        } else {
-            // Starts: bit i set where bytes i, i+1 and i+2 are zero. Stretches of 1 or 2
-            // zeros have no start, so they stay inside this literal stretch.
-            //
-            // The bytes past the word's end aren't loaded yet: count them as zeros. Then
-            // zeros touching the end are flagged as a start and taken as a zero stretch on
-            // the next pass, so they can join zeros at the start of the next word. If that
-            // run turns out shorter than 3, it is put back in the literal when it ends.
-            let in_word = _bzhi_u64(u64::MAX, remaining_bytes as u32);
-            let guessed = zero_mask | !in_word;
-            let starts = guessed & ((guessed >> 1) | (1 << 63)) & ((guessed >> 2) | (3 << 62)) & in_word;
-            // Byte 0 is non-zero, so the first start is at 1 or later. trailing_zeros is 64
-            // when there is no start: cap it at what remains.
-            (starts.trailing_zeros() as usize).min(remaining_bytes)
-        };
-        // A stretch can be the whole word, and a shift by 64 overflows: hence checked_shr.
-        zero_mask = zero_mask.checked_shr(stretch as u32).unwrap_or(0);
-        remaining_bytes -= stretch;
-
-        if is_zero_stretch {
-            // `stretch` more zeros follow the literal. Whether they are a run is decided
-            // when they end, so only count them here.
-            zero_len += stretch;
-
-            // The whole word was zeros: a long run is likely, so skip ahead 256 bytes at a
-            // time while they are all zero. `remaining_bytes` stays 0, so the refill then
-            // loads the first word after them.
-            if stretch == 64 {
-                while next_word + 256 <= full {
-                    let block: &[u8; 256] = src[next_word..next_word + 256].try_into().unwrap();
-                    if !is_zero_256(block) {
-                        break;
-                    }
-                    zero_len += 256;
-                    next_word += 256;
-                }
-            }
-        } else {
-            // `stretch` non-zero bytes: the zeros before them are complete.
-            if zero_len >= MIN_ZERO_RUN {
-                // A run: it ends the block.
-                let literal_end = literal_start + literal_len;
-                if written + block_len(literal_len, zero_len) >= escape_len(src_len) {
-                    return write_block(dst, src, 0);
-                }
-                written += write_block(&mut dst[written..], &src[literal_start..literal_end], zero_len);
-                literal_start = literal_end + zero_len;
-                literal_len = 0;
-            } else {
-                // 1 or 2 zeros are not a run: they stay in the literal.
-                literal_len += zero_len;
-            }
-            zero_len = 0;
-            literal_len += stretch;
-
-            // The whole word was literal, with no run starting in it: likely more literal
-            // follows, so skip ahead 256 bytes at a time while no run starts there. The
-            // check reads 64 bytes past the 256, for runs starting at their last 2 bytes.
-            // A word of 64 literal bytes ends with a non-zero byte (a zero there is flagged
-            // as a possible start), so no open zeros are skipped. `remaining_bytes` stays 0,
-            // so the refill then loads the first word after them.
-            if stretch == 64 {
-                while next_word + 320 <= src_len {
-                    let window: &[u8; 320] = src[next_word..next_word + 320].try_into().unwrap();
-                    if has_zero_run_256(window) {
-                        break;
-                    }
-                    literal_len += 256;
-                    next_word += 256;
-                }
-            }
+            position += 256;
         }
     }
+    if position >= src_len {
+        return src_len;
+    }
+    // The last 1 to 63 bytes: the bytes past the end load as zeros, so keep only the lanes
+    // wholly inside `src`.
+    let whole_lanes = (src_len - position) / LANE;
+    let lanes = zero_lane_mask::<LANE>(load_tail(&src[position..]))
+        & _bzhi_u64(u64::MAX, whole_lanes as u32);
+    if lanes == 0 {
+        return src_len;
+    }
+    position + lanes.trailing_zeros() as usize * LANE
+}
 
-    // The input ended: no non-zero stretch will close what is still open, so close it here.
-    if zero_len < MIN_ZERO_RUN {
-        // 1 or 2 zeros at the very end are not a run: they stay in the literal.
-        literal_len += zero_len;
-        zero_len = 0;
-    }
-    if literal_len > 0 || zero_len > 0 {
-        // The last block: the literal, then the zeros that end the input (0 if none).
-        if written + block_len(literal_len, zero_len) >= escape_len(src_len) {
-            return write_block(dst, src, 0);
+/// Returns where a stretch of zero bytes ends, 64 bytes at a time.
+///
+/// # Arguments
+///
+/// * `src` - The bytes.
+/// * `position` - Where the zeros start.
+///
+/// # Returns
+///
+/// The index of the first non-zero byte at or after `position`, or `src.len()` if there
+/// is none.
+#[target_feature(enable = "avx512f,avx512bw,bmi2")]
+fn end_of_zeros(src: &[u8], mut position: usize) -> usize {
+    let src_len = src.len();
+    while position + 64 <= src_len {
+        // SAFETY: position + 64 <= src_len, so the 64 bytes are in `src`.
+        let vector = unsafe { _mm512_loadu_si512(src.as_ptr().add(position).cast()) };
+        let nonzero = _mm512_test_epi8_mask(vector, vector);
+        if nonzero != 0 {
+            return position + nonzero.trailing_zeros() as usize;
         }
-        written += write_block(&mut dst[written..], &src[literal_start..literal_start + literal_len], zero_len);
+        position += 64;
+        // A whole vector of zeros: a long run is likely, so skip ahead 256 bytes at a time
+        // while they are all zero.
+        while position + 256 <= src_len {
+            let block: &[u8; 256] = src[position..position + 256].try_into().unwrap();
+            if !is_zero_256(block) {
+                break;
+            }
+            position += 256;
+        }
     }
-    written
+    if position >= src_len {
+        return src_len;
+    }
+    // The last 1 to 63 bytes: the bytes past the end load as zeros, so they never count as
+    // the non-zero byte that ends the run.
+    let vector = load_tail(&src[position..]);
+    let nonzero = _mm512_test_epi8_mask(vector, vector);
+    if nonzero == 0 {
+        return src_len;
+    }
+    position + nonzero.trailing_zeros() as usize
+}
+
+/// Returns where a run of zero words ends, 64 bytes at a time.
+///
+/// # Arguments
+///
+/// * `src` - The bytes.
+/// * `position` - Where the zero words start: a multiple of 8, at most `src.len()`.
+///
+/// # Returns
+///
+/// The start of the first non-zero word at or after `position`, or the end of the last
+/// whole word if they are all zero.
+#[target_feature(enable = "avx512f,avx512bw,bmi2")]
+fn end_of_zero_words(src: &[u8], mut position: usize) -> usize {
+    let src_len = src.len();
+    while position + 64 <= src_len {
+        // SAFETY: position + 64 <= src_len, so the 64 bytes are in `src`.
+        let vector = unsafe { _mm512_loadu_si512(src.as_ptr().add(position).cast()) };
+        // 8 bits, one per word: the first clear one is the first non-zero word.
+        let nonzero_words = !zero_lane_mask::<8>(vector) & 0xff;
+        if nonzero_words != 0 {
+            return position + nonzero_words.trailing_zeros() as usize * 8;
+        }
+        position += 64;
+        // A whole vector of zero words: a long run is likely, so skip ahead 256 bytes at a
+        // time while they are all zero.
+        while position + 256 <= src_len {
+            let block: &[u8; 256] = src[position..position + 256].try_into().unwrap();
+            if !is_zero_256(block) {
+                break;
+            }
+            position += 256;
+        }
+    }
+    // The last 0 to 63 bytes: only their whole words count. The bytes past the end load as
+    // zeros, so keep the words wholly inside `src`, and end at the last of them if all zero.
+    let whole_words = (src_len - position) / 8;
+    let in_src = _bzhi_u64(u64::MAX, whole_words as u32);
+    let nonzero_words = !zero_lane_mask::<8>(load_tail(&src[position..])) & in_src;
+    if nonzero_words == 0 {
+        return position + 8 * whole_words;
+    }
+    position + nonzero_words.trailing_zeros() as usize * 8
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compress_bound;
-    use crate::testutil::{Guarded, Rng, decompress, reference_compressed, require_avx512, sparse};
+    use crate::testutil::{
+        Guarded, MIN_ZERO_RUNS, Rng, aligned_edge_cases, decompress, reference_compressed,
+        reference_compressed_aligned, require_avx512, sparse,
+    };
+    use crate::{MIN_ZERO_RUN, compress_bound, escape_len};
 
-    fn compressed(src: &[u8]) -> Vec<u8> {
+    fn compressed(src: &[u8], min_zero_run: usize) -> Vec<u8> {
         require_avx512();
         let mut dst = vec![0u8; compress_bound(src.len())];
         // SAFETY: require_avx512 checked the CPU has AVX-512F, BW and BMI2.
-        let written = unsafe { compress(src, &mut dst) };
+        let written = unsafe { compress(src, &mut dst, min_zero_run) };
         dst.truncate(written);
         dst
     }
 
-    fn assert_matches_reference(src: &[u8], what: &str) {
-        assert_eq!(compressed(src), reference_compressed(src), "{what}");
+    fn assert_matches_reference(src: &[u8], min_zero_run: usize, what: &str) {
+        assert_eq!(
+            compressed(src, min_zero_run),
+            reference_compressed(src, min_zero_run),
+            "min {min_zero_run}, {what}"
+        );
     }
 
     #[test]
     fn t1_matches_the_reference_and_round_trips() {
-        // Lengths up to 2000: below 64, partial last words, runs crossing words, and long
+        // Lengths up to 2000: below 64, partial last vectors, runs crossing vectors, and long
         // runs that take the 256-byte skips.
         let mut rng = Rng::new(1);
-        for case in 0..500 {
-            let src = sparse(&mut rng, 2000);
-            let packed = compressed(&src);
-            assert_eq!(packed, reference_compressed(&src), "case {case}, {} bytes", src.len());
-            assert_eq!(decompress(&packed), src, "case {case}");
+        for &min_zero_run in &MIN_ZERO_RUNS {
+            for case in 0..200 {
+                let src = sparse(&mut rng, 2000, min_zero_run);
+                let packed = compressed(&src, min_zero_run);
+                assert_eq!(
+                    packed,
+                    reference_compressed(&src, min_zero_run),
+                    "min {min_zero_run}, case {case}"
+                );
+                assert_eq!(decompress(&packed), src, "min {min_zero_run}, case {case}");
+            }
         }
     }
 
     #[test]
-    fn t2_matches_the_reference_on_word_edges() {
+    fn t2_matches_the_reference_on_vector_edges() {
         // A run of `zeros` zeros starting at `start`, between non-zero bytes, for starts and
-        // lengths around the 64-byte word boundaries.
-        for len in [63, 64, 65, 127, 128, 129, 200] {
-            for start in 0..len {
-                for zeros in [1, 2, 3, 4, 64, 65] {
-                    let mut src = vec![0x5a; len];
-                    src[start..(start + zeros).min(len)].fill(0);
-                    assert_matches_reference(&src, &format!("len {len}, {zeros} zeros at {start}"));
+        // lengths around the 64-byte vector boundaries.
+        for &min_zero_run in &[3, 6, 7, 14, 15, 16] {
+            // Tails after the last whole vector of 1 byte, of whole lanes (66, 68, 72, 120)
+            // and of 63 bytes.
+            for len in [1, 15, 63, 64, 65, 66, 68, 72, 120, 127, 128, 129, 200] {
+                for start in 0..len {
+                    for zeros in [1, 2, min_zero_run - 1, min_zero_run, 64, 65] {
+                        let mut src = vec![0x5a; len];
+                        src[start..(start + zeros).min(len)].fill(0);
+                        assert_matches_reference(
+                            &src,
+                            min_zero_run,
+                            &format!("len {len}, {zeros} zeros at {start}"),
+                        );
+                    }
                 }
             }
         }
@@ -236,27 +319,48 @@ mod tests {
     #[test]
     fn t3_matches_the_reference_on_long_zero_runs() {
         // All zeros, and long runs ending before, at and after a 256-byte skip's edge.
-        for len in [64, 256, 320, 1000, 1024, 1100] {
-            assert_matches_reference(&vec![0u8; len], &format!("{len} zeros"));
-        }
-        for zeros in [255, 256, 257, 319, 320, 321, 600] {
-            let mut src = vec![0x11; 70];
-            src.extend(std::iter::repeat_n(0, zeros));
-            src.extend([0x22; 70]);
-            assert_matches_reference(&src, &format!("{zeros} zeros between literals"));
+        for &min_zero_run in &MIN_ZERO_RUNS {
+            for len in [64, 256, 320, 1000, 1024, 1100] {
+                assert_matches_reference(&vec![0u8; len], min_zero_run, &format!("{len} zeros"));
+            }
+            for zeros in [255, 256, 257, 319, 320, 321, 600] {
+                let mut src = vec![0x11; 70];
+                src.extend(std::iter::repeat_n(0, zeros));
+                src.extend([0x22; 70]);
+                assert_matches_reference(
+                    &src,
+                    min_zero_run,
+                    &format!("{zeros} zeros between literals"),
+                );
+            }
         }
     }
 
     #[test]
     fn t4_matches_the_reference_on_long_literals() {
-        // A long literal with scattered pairs of zeros (never a run), and one run of 3 at
-        // every position across several 256-byte skips, including their last bytes.
-        let literal: Vec<u8> = (0..1400).map(|index| if index % 7 < 2 { 0 } else { 0x33 }).collect();
-        assert_matches_reference(&literal, "no run at all");
-        for start in 0..900 {
-            let mut src = literal.clone();
-            src[start..start + 3].fill(0);
-            assert_matches_reference(&src, &format!("run at {start}"));
+        // A long literal with runs one short of the minimum every few bytes (never a run,
+        // but often a zero lane), and one run of exactly the minimum at every position
+        // across several 256-byte skips, including their last bytes.
+        for &min_zero_run in &[3, 7, 15, 16] {
+            let period = min_zero_run + 5;
+            let literal: Vec<u8> = (0..1400)
+                .map(|index| {
+                    if index % period < min_zero_run - 1 {
+                        0
+                    } else {
+                        0x33
+                    }
+                })
+                .collect();
+            assert_matches_reference(&literal, min_zero_run, "no run at all");
+            let dense = vec![0x33u8; 1400];
+            for start in 0..900 {
+                for base in [&literal, &dense] {
+                    let mut src = base.clone();
+                    src[start..start + min_zero_run].fill(0);
+                    assert_matches_reference(&src, min_zero_run, &format!("run at {start}"));
+                }
+            }
         }
     }
 
@@ -265,24 +369,203 @@ mod tests {
         let mut src = vec![0x11; 143];
         src.extend([0; 3]);
         src.extend([0x22; 143]);
-        let packed = compressed(&src);
+        let packed = compressed(&src, MIN_ZERO_RUN);
         assert_eq!(packed.len(), escape_len(src.len()));
-        assert_eq!(packed, reference_compressed(&src));
+        assert_eq!(packed, reference_compressed(&src, MIN_ZERO_RUN));
     }
 
     #[test]
     fn t6_never_reads_past_the_input() {
         // The input ends right before an unmapped page: one byte read past it is SIGSEGV.
-        // Literals and zeros at the end, for every length of the last partial word.
+        // Literals and zeros at the end, for every length of the last partial vector.
+        for &min_zero_run in &[3, 7, 16] {
+            for fill in [0x00, 0x5a] {
+                let mut guarded = Guarded::new(fill);
+                for len in 0..=400 {
+                    let src = guarded.tail(len);
+                    if len >= 10 {
+                        src[len / 2..len / 2 + 5].fill(fill ^ 0x5a);
+                    }
+                    let src = &*src;
+                    assert_matches_reference(
+                        src,
+                        min_zero_run,
+                        &format!("{len} bytes of {fill:#04x} at a page's end"),
+                    );
+                    // Put the page back for the next length.
+                    guarded.tail(len).fill(fill);
+                }
+            }
+        }
+    }
+
+    fn check_find_zero_lane<const LANE: usize>(rng: &mut Rng) {
+        for case in 0..100 {
+            let src = sparse(rng, 700, 2 * LANE);
+            for position in (0..=src.len() + LANE).step_by(LANE) {
+                let expected = (position..src.len())
+                    .step_by(LANE)
+                    .find(|&lane| {
+                        lane + LANE <= src.len()
+                            && src[lane..lane + LANE].iter().all(|&byte| byte == 0)
+                    })
+                    .unwrap_or(src.len());
+                // SAFETY: the caller ran require_avx512.
+                let found = unsafe { find_zero_lane::<LANE>(&src, position) };
+                assert_eq!(
+                    found, expected,
+                    "lanes of {LANE}, case {case}, from {position}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t7_find_zero_lane_matches_a_lane_scan() {
+        require_avx512();
+        let mut rng = Rng::new(7);
+        check_find_zero_lane::<2>(&mut rng);
+        check_find_zero_lane::<4>(&mut rng);
+        check_find_zero_lane::<8>(&mut rng);
+    }
+
+    #[test]
+    fn t8_end_of_zeros_matches_a_byte_scan() {
+        require_avx512();
+        let mut rng = Rng::new(8);
+        for case in 0..100 {
+            let src = sparse(&mut rng, 700, 64);
+            for position in 0..=src.len() {
+                let end = (position..src.len())
+                    .find(|&index| src[index] != 0)
+                    .unwrap_or(src.len());
+                // SAFETY: require_avx512 checked the CPU has AVX-512F, BW and BMI2.
+                assert_eq!(
+                    unsafe { end_of_zeros(&src, position) },
+                    end,
+                    "case {case}, from {position}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t9_scanners_never_read_past_the_input() {
+        require_avx512();
         for fill in [0x00, 0x5a] {
             let mut guarded = Guarded::new(fill);
-            for len in 64..=400 {
+            for len in 0..=200 {
+                let src = &*guarded.tail(len);
+                for position in (0..=len).step_by(8) {
+                    // SAFETY: require_avx512 checked the CPU has AVX-512F, BW and BMI2.
+                    unsafe {
+                        find_zero_lane::<2>(src, position);
+                        find_zero_lane::<4>(src, position);
+                        find_zero_lane::<8>(src, position);
+                        end_of_zeros(src, position);
+                    }
+                }
+            }
+        }
+    }
+
+    fn compressed_aligned(src: &[u8], min_zero_words: usize) -> Vec<u8> {
+        require_avx512();
+        let mut dst = vec![0u8; compress_bound(src.len())];
+        // SAFETY: require_avx512 checked the CPU has AVX-512F, BW and BMI2.
+        let written = unsafe { compress_aligned(src, &mut dst, min_zero_words) };
+        dst.truncate(written);
+        dst
+    }
+
+    #[test]
+    fn t10_aligned_matches_the_reference_on_edge_cases() {
+        // Among them, runs starting, ending and crossing each 64-byte vector boundary, and
+        // long runs that take the 256-byte skip.
+        for min_zero_words in [2, 3, 5] {
+            for (name, src) in aligned_edge_cases(min_zero_words) {
+                assert_eq!(
+                    compressed_aligned(&src, min_zero_words),
+                    reference_compressed_aligned(&src, min_zero_words),
+                    "{min_zero_words} words, {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t11_aligned_matches_the_reference_and_round_trips() {
+        let mut rng = Rng::new(11);
+        for min_zero_words in [2, 3, 5, 40] {
+            for case in 0..200 {
+                let src = sparse(&mut rng, 2000, 8 * min_zero_words);
+                let packed = compressed_aligned(&src, min_zero_words);
+                assert_eq!(
+                    packed,
+                    reference_compressed_aligned(&src, min_zero_words),
+                    "{min_zero_words} words, case {case}"
+                );
+                assert_eq!(
+                    decompress(&packed),
+                    src,
+                    "{min_zero_words} words, case {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t12_aligned_never_reads_past_the_input() {
+        // Zero words, partial words and literals at the end of a page, for every length of
+        // the last partial vector.
+        for fill in [0x00, 0x5a] {
+            let mut guarded = Guarded::new(fill);
+            for len in 0..=400 {
                 let src = guarded.tail(len);
-                src[len / 2..len / 2 + 5].fill(fill ^ 0x5a);
+                if len >= 40 {
+                    src[len / 2..len / 2 + 5].fill(fill ^ 0x5a);
+                }
                 let src = &*src;
-                assert_matches_reference(src, &format!("{len} bytes of {fill:#04x} at a page's end"));
-                // Put the page back for the next length.
+                assert_eq!(
+                    compressed_aligned(src, 2),
+                    reference_compressed_aligned(src, 2),
+                    "{len} bytes of {fill:#04x} at a page's end"
+                );
                 guarded.tail(len).fill(fill);
+            }
+        }
+    }
+
+    #[test]
+    fn t13_end_of_zero_words_matches_a_word_scan() {
+        require_avx512();
+        let mut rng = Rng::new(13);
+        for case in 0..100 {
+            let src = sparse(&mut rng, 700, 64);
+            let is_zero_word = |word: usize| src[word..word + 8].iter().all(|&byte| byte == 0);
+            let last_word_end = src.len() / 8 * 8;
+            for position in (0..=src.len()).step_by(8) {
+                let end = (position..last_word_end)
+                    .step_by(8)
+                    .find(|&word| !is_zero_word(word))
+                    .unwrap_or(last_word_end);
+                // SAFETY: require_avx512 checked the CPU has AVX-512F, BW and BMI2.
+                let found = unsafe { end_of_zero_words(&src, position) };
+                assert_eq!(found, end, "case {case}, from {position}");
+            }
+        }
+        // Past the end of a page: the scan must stop at the last whole word.
+        let mut guarded = Guarded::new(0);
+        for len in 0..=200 {
+            let src = &*guarded.tail(len);
+            for position in (0..=len).step_by(8) {
+                // SAFETY: as above.
+                let found = unsafe { end_of_zero_words(src, position) };
+                assert_eq!(
+                    found,
+                    len / 8 * 8,
+                    "{len} zeros at a page's end, from {position}"
+                );
             }
         }
     }

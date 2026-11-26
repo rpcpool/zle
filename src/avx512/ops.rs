@@ -2,7 +2,7 @@
 
 use std::arch::x86_64::*;
 
-/// Returns which of at most 64 bytes are zero, reading none past the slice.
+/// Loads at most 64 bytes, reading none past the slice.
 ///
 /// # Arguments
 ///
@@ -10,21 +10,69 @@ use std::arch::x86_64::*;
 ///
 /// # Returns
 ///
-/// A mask with bit `i` set where `bytes[i] == 0`; bits from `bytes.len()` up are clear.
+/// A vector holding `bytes`, then zeros from byte `bytes.len()` up.
 ///
 /// # Panics
 ///
 /// Panics if `bytes` is longer than 64.
 #[target_feature(enable = "avx512f,avx512bw,bmi2")]
-pub fn zero_mask_tail(bytes: &[u8]) -> u64 {
+pub fn load_tail(bytes: &[u8]) -> __m512i {
     assert!(bytes.len() <= 64);
     // The first `bytes.len()` lanes. Unlike `(1 << n) - 1`, bzhi works for n = 64.
     let in_slice = _bzhi_u64(u64::MAX, bytes.len() as u32);
     // SAFETY: a masked load reads only the selected lanes, all inside the slice; the others
     // are never touched, so they can't fault.
-    let loaded = unsafe { _mm512_maskz_loadu_epi8(in_slice, bytes.as_ptr().cast()) };
-    // The unselected lanes were loaded as zeros: clear their bits.
-    _mm512_cmpeq_epi8_mask(loaded, _mm512_setzero_si512()) & in_slice
+    unsafe { _mm512_maskz_loadu_epi8(in_slice, bytes.as_ptr().cast()) }
+}
+
+/// Returns which `LANE`-byte lanes of a vector are zero.
+///
+/// # Arguments
+///
+/// * `LANE` - The lane width in bytes: 2, 4 or 8.
+/// * `vector` - 64 bytes, `64 / LANE` lanes.
+///
+/// # Returns
+///
+/// A mask with bit `i` set where lane `i` (bytes `i * LANE` to `i * LANE + LANE - 1`) is
+/// zero; bits from `64 / LANE` up are clear.
+#[target_feature(enable = "avx512f,avx512bw")]
+pub fn zero_lane_mask<const LANE: usize>(vector: __m512i) -> u64 {
+    let zero = _mm512_setzero_si512();
+    // LANE is a constant: only one arm is compiled into each copy.
+    match LANE {
+        2 => _mm512_cmpeq_epi16_mask(vector, zero) as u64,
+        4 => _mm512_cmpeq_epi32_mask(vector, zero) as u64,
+        8 => _mm512_cmpeq_epi64_mask(vector, zero) as u64,
+        _ => unreachable!("lanes of {LANE} bytes"),
+    }
+}
+
+/// Returns whether 256 bytes hold an aligned zero lane.
+///
+/// # Arguments
+///
+/// * `LANE` - The lane width in bytes: 2, 4 or 8.
+/// * `block` - The 256 bytes; their lanes are aligned to the block's start.
+///
+/// # Returns
+///
+/// `true` if some `LANE` bytes at a multiple of `LANE` are all zero.
+#[target_feature(enable = "avx512f,avx512bw")]
+pub fn has_zero_lane_256<const LANE: usize>(block: &[u8; 256]) -> bool {
+    let vectors: [__m512i; 4] = std::array::from_fn(|vector_index| {
+        // SAFETY: the block holds 256 bytes, so the 64 at vector_index * 64 are readable.
+        unsafe { _mm512_loadu_si512(block.as_ptr().add(vector_index * 64).cast()) }
+    });
+    // The unsigned minimum per lane is zero where any of the four is zero.
+    let min = |a: __m512i, b: __m512i| match LANE {
+        2 => _mm512_min_epu16(a, b),
+        4 => _mm512_min_epu32(a, b),
+        8 => _mm512_min_epu64(a, b),
+        _ => unreachable!("lanes of {LANE} bytes"),
+    };
+    let merged = min(min(vectors[0], vectors[1]), min(vectors[2], vectors[3]));
+    zero_lane_mask::<LANE>(merged) != 0
 }
 
 /// Returns whether 256 bytes are all zero.
@@ -43,34 +91,12 @@ pub fn is_zero_256(block: &[u8; 256]) -> bool {
         unsafe { _mm512_loadu_si512(block.as_ptr().add(vector_index * 64).cast()) }
     });
     // A byte of the OR is zero only where it is zero in all four.
-    let ored = or3(vectors[0], vectors[1], _mm512_or_si512(vectors[2], vectors[3]));
+    let ored = or3(
+        vectors[0],
+        vectors[1],
+        _mm512_or_si512(vectors[2], vectors[3]),
+    );
     _mm512_test_epi8_mask(ored, ored) == 0
-}
-
-/// Returns whether a run of 3 zero bytes starts in the first 256 bytes of a window.
-///
-/// # Arguments
-///
-/// * `window` - 320 bytes: the 256 to search, then 64 more for runs that start at the end.
-///
-/// # Returns
-///
-/// `true` if some `i < 256` has `window[i..i + 3]` all zero.
-#[target_feature(enable = "avx512f,avx512bw")]
-pub fn has_zero_run_256(window: &[u8; 320]) -> bool {
-    // The 5 vectors of the window: 4 to search, and the 5th for runs starting at 254, 255.
-    let vectors: [__m512i; 5] = std::array::from_fn(|vector_index| {
-        // SAFETY: the window holds 320 bytes, so the 64 at vector_index * 64 are readable.
-        unsafe { _mm512_loadu_si512(window.as_ptr().add(vector_index * 64).cast()) }
-    });
-    // Byte i is zero where bytes i, i+1 and i+2 of the window are: a run starts at i.
-    let starts = |vector_index: usize| {
-        let (lo, hi) = (vectors[vector_index], vectors[vector_index + 1]);
-        or3(lo, shift_bytes::<1>(lo, hi), shift_bytes::<2>(lo, hi))
-    };
-    // The unsigned minimum per byte is zero where either is zero.
-    let merged = _mm512_min_epu8(_mm512_min_epu8(starts(0), starts(1)), _mm512_min_epu8(starts(2), starts(3)));
-    _mm512_testn_epi8_mask(merged, merged) != 0
 }
 
 /// Returns `a | b | c`, in one instruction.
@@ -89,28 +115,6 @@ fn or3(a: __m512i, b: __m512i, c: __m512i) -> __m512i {
     _mm512_ternarylogic_epi32::<0xFE>(a, b, c)
 }
 
-/// Returns bytes `K..K + 64` of the 128 bytes `lo` then `hi`.
-///
-/// # Arguments
-///
-/// * `K` - The shift, in bytes, `0..=15`.
-/// * `lo` - Bytes 0 to 63.
-/// * `hi` - Bytes 64 to 127.
-///
-/// # Returns
-///
-/// `lo` shifted down by `K` bytes, with the first `K` bytes of `hi` shifted in at the top.
-#[target_feature(enable = "avx512f,avx512bw")]
-fn shift_bytes<const K: i32>(lo: __m512i, hi: __m512i) -> __m512i {
-    // vpalignr shifts within each 128-bit lane only. So first shift by 4 elements of 4
-    // bytes, one whole lane (valignd crosses lanes): lane n of `next` is lane n + 1 of `lo`,
-    // and its lane 3 is lane 0 of `hi`.
-    let next = _mm512_alignr_epi32::<4>(hi, lo);
-    // Per lane, `next` then `lo` shifted down by K bytes: the lane's own bytes from K on,
-    // then the first K bytes of the following lane.
-    _mm512_alignr_epi8::<K>(next, lo)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,46 +130,123 @@ mod tests {
         unsafe { std::mem::transmute(vector) }
     }
 
-    fn window_with_zeros(zeros: std::ops::Range<usize>) -> [u8; 320] {
-        let mut window = [0x5au8; 320];
-        window[zeros].fill(0);
-        window
-    }
-
-    fn has_run(window: &[u8; 320]) -> bool {
-        require_avx512();
-        // SAFETY: require_avx512 checked the CPU has AVX-512F and BW.
-        unsafe { has_zero_run_256(window) }
+    /// The lanes of `bytes` that are all zero, one at a time.
+    fn zero_lanes_bytewise<const LANE: usize>(bytes: &[u8]) -> u64 {
+        bytes
+            .chunks_exact(LANE)
+            .enumerate()
+            .filter(|(_, lane)| lane.iter().all(|&byte| byte == 0))
+            .fold(0, |mask, (lane_index, _)| mask | 1 << lane_index)
     }
 
     #[test]
-    fn t1_zero_mask_tail_clears_bits_past_the_slice() {
+    fn t1_load_tail_zeroes_past_the_slice() {
         require_avx512();
-        let zeros = [0u8; 64];
-        for len in 0..64 {
+        let bytes: [u8; 64] = std::array::from_fn(|index| 1 + index as u8);
+        for len in 0..=64 {
             // SAFETY: require_avx512 checked the CPU has AVX-512F, BW and BMI2.
-            assert_eq!(unsafe { zero_mask_tail(&zeros[..len]) }, (1u64 << len) - 1, "{len} zero bytes");
+            let loaded = bytes_of(unsafe { load_tail(&bytes[..len]) });
+            let expected: [u8; 64] =
+                std::array::from_fn(|index| if index < len { bytes[index] } else { 0 });
+            assert_eq!(loaded, expected, "{len} bytes");
         }
-        let mut bytes = [0u8; 64];
-        bytes[63] = 1;
-        // SAFETY: as above.
-        assert_eq!(unsafe { zero_mask_tail(&bytes) }, u64::MAX >> 1);
     }
 
     #[test]
-    fn t2_zero_mask_tail_never_reads_past_the_slice() {
+    fn t2_load_tail_never_reads_past_the_slice() {
         require_avx512();
         // The slice ends right before an unmapped page: one byte read past it is SIGSEGV.
-        let mut guarded = Guarded::new(0);
+        let mut guarded = Guarded::new(0x5a);
         for len in 0..=64 {
-            let expected = if len == 64 { u64::MAX } else { (1u64 << len) - 1 };
             // SAFETY: require_avx512 checked the CPU has AVX-512F, BW and BMI2.
-            assert_eq!(unsafe { zero_mask_tail(guarded.tail(len)) }, expected, "{len} bytes at a page's end");
+            let loaded = bytes_of(unsafe { load_tail(guarded.tail(len)) });
+            assert!(
+                loaded[..len].iter().all(|&byte| byte == 0x5a),
+                "{len} bytes at a page's end"
+            );
+        }
+    }
+
+    fn check_zero_lane_mask<const LANE: usize>(rng: &mut Rng) {
+        // Each lane zero or not, and a non-zero lane with one non-zero byte at any place.
+        for case in 0..200 {
+            let bytes: [u8; 64] = std::array::from_fn(|_| {
+                if rng.below(LANE + 1) == 0 {
+                    rng.nonzero_byte()
+                } else {
+                    0
+                }
+            });
+            // SAFETY: the callers ran require_avx512, which checked AVX-512F and BW.
+            let mask = unsafe { zero_lane_mask::<LANE>(vector(bytes)) };
+            assert_eq!(
+                mask,
+                zero_lanes_bytewise::<LANE>(&bytes),
+                "lanes of {LANE}, case {case}: {bytes:02x?}"
+            );
         }
     }
 
     #[test]
-    fn t3_is_zero_256_sees_one_nonzero_byte_anywhere() {
+    fn t3_zero_lane_mask_flags_exactly_the_zero_lanes() {
+        require_avx512();
+        let mut rng = Rng::new(3);
+        check_zero_lane_mask::<2>(&mut rng);
+        check_zero_lane_mask::<4>(&mut rng);
+        check_zero_lane_mask::<8>(&mut rng);
+    }
+
+    fn check_has_zero_lane_256<const LANE: usize>() {
+        // SAFETY (every call below): the callers ran require_avx512, which checked
+        // AVX-512F and BW.
+        assert!(
+            !unsafe { has_zero_lane_256::<LANE>(&[0x5a; 256]) },
+            "lanes of {LANE}: no zero"
+        );
+        // With 0xff around it, a zero lane is the unsigned minimum but not the signed one.
+        for filler in [0x5a, 0xff] {
+            for lane_start in (0..256).step_by(LANE) {
+                let mut block = [filler; 256];
+                block[lane_start..lane_start + LANE].fill(0);
+                assert!(
+                    unsafe { has_zero_lane_256::<LANE>(&block) },
+                    "lanes of {LANE}: zero lane at {lane_start} among {filler:#04x}"
+                );
+            }
+        }
+        // LANE zeros straddling two lanes, at every misaligned start: no lane is zero.
+        for zeros_start in (0..256 - LANE).filter(|start| start % LANE != 0) {
+            let mut block = [0x5au8; 256];
+            block[zeros_start..zeros_start + LANE].fill(0);
+            assert!(
+                !unsafe { has_zero_lane_256::<LANE>(&block) },
+                "lanes of {LANE}: zeros at {zeros_start}"
+            );
+        }
+        // 0x80 and 0x01 in each byte of a lane: the minimum must be unsigned and per lane.
+        for byte_in_lane in 0..LANE {
+            for value in [0x01, 0x80, 0xff] {
+                let mut block = [0x5au8; 256];
+                block[64..64 + LANE].fill(0);
+                block[64 + byte_in_lane] = value;
+                assert!(
+                    !unsafe { has_zero_lane_256::<LANE>(&block) },
+                    "lanes of {LANE}: {value:#04x} at {byte_in_lane}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t4_has_zero_lane_256_finds_only_aligned_zero_lanes() {
+        require_avx512();
+        check_has_zero_lane_256::<2>();
+        check_has_zero_lane_256::<4>();
+        check_has_zero_lane_256::<8>();
+    }
+
+    #[test]
+    fn t5_is_zero_256_sees_one_nonzero_byte_anywhere() {
         require_avx512();
         // SAFETY: require_avx512 checked the CPU has AVX-512F and BW.
         assert!(unsafe { is_zero_256(&[0; 256]) });
@@ -174,55 +255,33 @@ mod tests {
                 let mut block = [0u8; 256];
                 block[byte_index] = value;
                 // SAFETY: as above.
-                assert!(!unsafe { is_zero_256(&block) }, "byte {byte_index} = {value:#04x}");
+                assert!(
+                    !unsafe { is_zero_256(&block) },
+                    "byte {byte_index} = {value:#04x}"
+                );
             }
         }
-    }
-
-    #[test]
-    fn t4_has_zero_run_256_finds_a_run_starting_anywhere() {
-        assert!(!has_run(&[0x5a; 320]));
-        for start in 0..256 {
-            assert!(has_run(&window_with_zeros(start..start + 3)), "run at {start}");
-        }
-        assert!(has_run(&window_with_zeros(254..257)), "254, 255 and 256");
-        assert!(has_run(&window_with_zeros(255..258)), "255, 256 and 257");
-    }
-
-    #[test]
-    fn t5_has_zero_run_256_ignores_pairs_and_later_runs() {
-        let pairs: [u8; 320] = std::array::from_fn(|index| if index % 3 == 2 { 1 } else { 0 });
-        assert!(!has_run(&pairs), "00 00 01 repeated: never 3 zeros in a row");
-        assert!(!has_run(&window_with_zeros(256..320)), "a run starting at 256 is the next block's");
-        assert!(!has_run(&window_with_zeros(255..257)), "two zeros only");
     }
 
     #[test]
     fn t6_or3_ors_three_vectors() {
         require_avx512();
         let mut rng = Rng::new(6);
-        let mut random = || std::array::from_fn::<u8, 64, _>(|_| if rng.below(4) == 0 { rng.nonzero_byte() } else { 0 });
+        let mut random = || {
+            std::array::from_fn::<u8, 64, _>(|_| {
+                if rng.below(4) == 0 {
+                    rng.nonzero_byte()
+                } else {
+                    0
+                }
+            })
+        };
         for _ in 0..50 {
             let (a, b, c) = (random(), random(), random());
             // SAFETY: require_avx512 checked the CPU has AVX-512F.
             let ored = bytes_of(unsafe { or3(vector(a), vector(b), vector(c)) });
             let expected: [u8; 64] = std::array::from_fn(|index| a[index] | b[index] | c[index]);
             assert_eq!(ored, expected);
-        }
-    }
-
-    #[test]
-    fn t7_shift_bytes_crosses_the_lanes() {
-        require_avx512();
-        let lo = vector(std::array::from_fn(|index| index as u8));
-        let hi = vector(std::array::from_fn(|index| 64 + index as u8));
-        let expected = |shift: u8| -> [u8; 64] { std::array::from_fn(|index| shift + index as u8) };
-        // SAFETY: require_avx512 checked the CPU has AVX-512F and BW.
-        unsafe {
-            assert_eq!(bytes_of(shift_bytes::<0>(lo, hi)), expected(0));
-            assert_eq!(bytes_of(shift_bytes::<1>(lo, hi)), expected(1), "byte 15 comes from the next lane");
-            assert_eq!(bytes_of(shift_bytes::<2>(lo, hi)), expected(2));
-            assert_eq!(bytes_of(shift_bytes::<15>(lo, hi)), expected(15));
         }
     }
 }

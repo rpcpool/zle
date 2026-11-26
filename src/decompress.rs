@@ -9,7 +9,11 @@ use crate::leb128;
 /// The largest length a header nibble holds; 15 means an extension follows.
 const NIBBLE_MAX: u8 = 15;
 
-/// Why [`decompress`] rejected its input.
+/// Why [`decompress`](crate::decompress) rejected its input. Implements
+/// [`std::error::Error`], so `?` converts it into `Box<dyn Error>` or `anyhow::Error`.
+///
+/// Every variant means the input is not a stream of this crate's blocks, or `dst` is too
+/// small for it: retrying the same call gives the same error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecompressError {
     /// The input ends inside a block: in a length extension or in the literal.
@@ -60,7 +64,9 @@ pub fn decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, DecompressError> 
 
         let literal_len = length(header >> 4, src, &mut read)?;
         let literal_len = fit(literal_len, dst.len() - written)?;
-        let literal = src.get(read..read + literal_len).ok_or(DecompressError::Truncated)?;
+        let literal = src
+            .get(read..read + literal_len)
+            .ok_or(DecompressError::Truncated)?;
         dst[written..written + literal_len].copy_from_slice(literal);
         read += literal_len;
         written += literal_len;
@@ -98,7 +104,10 @@ pub(crate) fn length(nibble: u8, src: &[u8], read: &mut usize) -> Result<u64, De
         leb128::GetError::Overflow => DecompressError::LengthOverflow,
     })?;
     *read += extension.len;
-    extension.value.checked_add(NIBBLE_MAX as u64).ok_or(DecompressError::LengthOverflow)
+    extension
+        .value
+        .checked_add(NIBBLE_MAX as u64)
+        .ok_or(DecompressError::LengthOverflow)
 }
 
 /// Checks a length against the room left in `dst`.
@@ -117,13 +126,17 @@ pub(crate) fn length(nibble: u8, src: &[u8], read: &mut usize) -> Result<u64, De
 /// [`DecompressError::DstTooSmall`] if `len` is more than `room`.
 pub(crate) fn fit(len: u64, room: usize) -> Result<usize, DecompressError> {
     // Comparing as u64 first: on a 32-bit target, `len as usize` could wrap.
-    if len > room as u64 { Err(DecompressError::DstTooSmall) } else { Ok(len as usize) }
+    if len > room as u64 {
+        Err(DecompressError::DstTooSmall)
+    } else {
+        Ok(len as usize)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{Rng, sparse};
+    use crate::testutil::{MIN_ZERO_RUNS, Rng, sparse};
     use crate::{compress, compress_bound};
 
     fn decompressed(src: &[u8], dst_len: usize) -> Result<Vec<u8>, DecompressError> {
@@ -144,7 +157,10 @@ mod tests {
     #[test]
     fn t1_small_examples() {
         assert_eq!(decompressed(&[], 0), Ok(vec![]));
-        assert_eq!(decompressed(&[0x13, 1, 0x10, 2], 5), Ok(vec![1, 0, 0, 0, 2]));
+        assert_eq!(
+            decompressed(&[0x13, 1, 0x10, 2], 5),
+            Ok(vec![1, 0, 0, 0, 2])
+        );
         assert_eq!(decompressed(&[0x40, 1, 0, 0, 2], 4), Ok(vec![1, 0, 0, 2]));
         assert_eq!(decompressed(&[0x0f, 85], 100), Ok(vec![0; 100]));
     }
@@ -153,8 +169,16 @@ mod tests {
     fn t2_round_trips() {
         let mut rng = Rng::new(3);
         for case in 0..300 {
-            let src = sparse(&mut rng, 2000);
-            assert_eq!(decompressed(&compressed(&src), src.len()), Ok(src), "case {case}");
+            // Every minimum in turn: a longer one leaves short runs inside long literals.
+            let min_zero_run = MIN_ZERO_RUNS[case % MIN_ZERO_RUNS.len()];
+            let src = sparse(&mut rng, 2000, min_zero_run);
+            let mut packed = vec![0u8; crate::compress_bound(src.len())];
+            let written = crate::compress_with_min_run(&src, &mut packed, min_zero_run);
+            assert_eq!(
+                decompressed(&packed[..written], src.len()),
+                Ok(src),
+                "min {min_zero_run}, case {case}"
+            );
         }
     }
 
@@ -166,13 +190,23 @@ mod tests {
         src.extend([9; 30]);
         let packed = compressed(&src);
         assert_eq!(decompressed(&packed, src.len()), Ok(src.clone()));
-        assert_eq!(decompressed(&packed, src.len() + 10), Ok(src.clone()), "spare room is fine");
-        assert_eq!(decompressed(&packed, src.len() - 1), Err(DecompressError::DstTooSmall));
+        assert_eq!(
+            decompressed(&packed, src.len() + 10),
+            Ok(src.clone()),
+            "spare room is fine"
+        );
+        assert_eq!(
+            decompressed(&packed, src.len() - 1),
+            Err(DecompressError::DstTooSmall)
+        );
     }
 
     #[test]
     fn t4_dst_too_small_in_literal_and_in_zeros() {
-        assert_eq!(decompressed(&[0x30, 1, 2, 3], 2), Err(DecompressError::DstTooSmall));
+        assert_eq!(
+            decompressed(&[0x30, 1, 2, 3], 2),
+            Err(DecompressError::DstTooSmall)
+        );
         assert_eq!(decompressed(&[0x05], 4), Err(DecompressError::DstTooSmall));
     }
 
@@ -195,10 +229,25 @@ mod tests {
 
     #[test]
     fn t6_truncated_literal_and_extensions() {
-        assert_eq!(decompressed(&[0x30, 1, 2], 10), Err(DecompressError::Truncated), "literal");
-        assert_eq!(decompressed(&[0xf0], 100), Err(DecompressError::Truncated), "L extension");
-        assert_eq!(decompressed(&[0xf0, 0x80], 100), Err(DecompressError::Truncated));
-        assert_eq!(decompressed(&[0x0f], 100), Err(DecompressError::Truncated), "Z extension");
+        assert_eq!(
+            decompressed(&[0x30, 1, 2], 10),
+            Err(DecompressError::Truncated),
+            "literal"
+        );
+        assert_eq!(
+            decompressed(&[0xf0], 100),
+            Err(DecompressError::Truncated),
+            "L extension"
+        );
+        assert_eq!(
+            decompressed(&[0xf0, 0x80], 100),
+            Err(DecompressError::Truncated)
+        );
+        assert_eq!(
+            decompressed(&[0x0f], 100),
+            Err(DecompressError::Truncated),
+            "Z extension"
+        );
     }
 
     #[test]
@@ -228,6 +277,36 @@ mod tests {
     #[test]
     fn t9_accepts_blocks_the_compressor_never_writes() {
         // Runs of 1 zero, an empty block and a 15 nibble with a 0 extension.
-        assert_eq!(decompressed(&[0x11, 7, 0x00, 0x0f, 0x00], 20), Ok([vec![7, 0], vec![0; 15]].concat()));
+        assert_eq!(
+            decompressed(&[0x11, 7, 0x00, 0x0f, 0x00], 20),
+            Ok([vec![7, 0], vec![0; 15]].concat())
+        );
+    }
+
+    #[test]
+    fn t10_decompress_error_is_a_std_error() {
+        // As callers use it: boxed with `?` into an error that crosses threads.
+        fn boxed(error: DecompressError) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            error.into()
+        }
+        for (error, message) in [
+            (
+                DecompressError::Truncated,
+                "compressed input ends inside a block",
+            ),
+            (
+                DecompressError::LengthOverflow,
+                "a length extension overflows 64 bits",
+            ),
+            (
+                DecompressError::DstTooSmall,
+                "decompressed output is longer than dst",
+            ),
+        ] {
+            let boxed = boxed(error);
+            assert_eq!(boxed.to_string(), message);
+            assert!(boxed.source().is_none(), "{error:?} wraps no other error");
+            assert_eq!(boxed.downcast_ref::<DecompressError>(), Some(&error));
+        }
     }
 }
