@@ -6,6 +6,10 @@
 //!
 //! Masked-off lanes are neither read nor written, and never fault, so nothing is touched
 //! past the end of `src` or `dst`: no slack is needed after either.
+//!
+//! The masked [`copy`] and [`zero`] are derived from Richard Patel's zle
+//! (<https://github.com/riptl/zle>, `zle_copy64` and `zle_zero` in `lib/zle.c`), under the
+//! BSD 3-Clause License: see `LICENSE-BSD-3-Clause` at the crate's root.
 
 use std::arch::x86_64::*;
 
