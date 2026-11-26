@@ -1,0 +1,28 @@
+[package]
+name = "zle"
+version = "0.1.0"
+edition = "2024"
+authors = ["Louis-Vincent <louis-vincent@triton.one>"]
+readme = "README.md"
+publish = true
+license = "MIT OR Apache-2.0"
+description = "Zero-length encoding: drops runs of zero bytes, with an AVX-512 compressor and decompressor."
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "zle"
+harness = false
+
+[[bench]]
+name = "scalar_vs_avx512"
+harness = false
+required-features = ["internals"]
+
+[features]
+# Exposes the scalar and AVX-512 implementations directly, for benches/scalar_vs_avx512.rs.
+# Not a stable API.
+internals = []

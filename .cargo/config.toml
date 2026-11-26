@@ -1,0 +1,8 @@
+# Test binaries run inside Intel SDE, which emulates a Sapphire Rapids CPU (-spr) with
+# AVX-512F, BW and BMI2, so the AVX-512 compressor is tested on CPUs without AVX-512.
+# `.tools` is a symlink to the SDE install (see .gitignore).
+#
+# Doc tests run natively (rustdoc ignores the runner): `compress` then picks the scalar
+# path on a CPU without AVX-512. Timings under SDE mean nothing: benchmark on real hardware.
+[target.x86_64-unknown-linux-gnu]
+runner = [".tools/sde-external-9.58.0-2025-06-16-lin/sde64", "-spr", "--"]
