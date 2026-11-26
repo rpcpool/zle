@@ -39,7 +39,11 @@ fn header(literal_len: usize, zero_len: usize) -> u8 {
 ///
 /// 0 below 15 (the nibble holds it), else the LEB128 length of `len - 15`.
 fn extension_len(len: usize) -> usize {
-    if len < NIBBLE_MAX { 0 } else { leb128::len((len - NIBBLE_MAX) as u64) }
+    if len < NIBBLE_MAX {
+        0
+    } else {
+        leb128::len((len - NIBBLE_MAX) as u64)
+    }
 }
 
 /// Returns how many bytes [`write_block`] writes.
@@ -106,7 +110,11 @@ mod tests {
     #[test]
     fn t2_header_saturates_at_15() {
         assert_eq!(header(15, 0), 0xf0);
-        assert_eq!(header(200, 40), 0xff, "15 means: 15 or more, see the extension");
+        assert_eq!(
+            header(200, 40),
+            0xff,
+            "15 means: 15 or more, see the extension"
+        );
     }
 
     #[test]

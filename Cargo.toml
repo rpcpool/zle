@@ -2,9 +2,11 @@
 name = "zle"
 version = "0.1.0"
 edition = "2024"
+# The AVX-512 intrinsics and target features are stable from Rust 1.89.
+rust-version = "1.89"
 authors = ["Louis-Vincent <louis-vincent@triton.one>"]
 readme = "README.md"
-publish = true
+publish = false
 license = "MIT OR Apache-2.0"
 description = "Zero-length encoding: drops runs of zero bytes, with an AVX-512 compressor and decompressor."
 
@@ -19,6 +21,15 @@ harness = false
 
 [[bench]]
 name = "scalar_vs_avx512"
+harness = false
+required-features = ["internals"]
+
+[[bench]]
+name = "account_like"
+harness = false
+
+[[bench]]
+name = "min_run_sweep"
 harness = false
 required-features = ["internals"]
 

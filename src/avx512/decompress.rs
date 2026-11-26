@@ -42,7 +42,9 @@ pub fn decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, DecompressError> 
 
         let literal_len = length(header >> 4, src, &mut read)?;
         let literal_len = fit(literal_len, dst.len() - written)?;
-        let literal = src.get(read..read + literal_len).ok_or(DecompressError::Truncated)?;
+        let literal = src
+            .get(read..read + literal_len)
+            .ok_or(DecompressError::Truncated)?;
         copy(literal, &mut dst[written..written + literal_len]);
         read += literal_len;
         written += literal_len;
@@ -92,7 +94,13 @@ fn zero(to: &mut [u8]) {
     }
     // SAFETY: lanes the mask clears are not written and cannot fault; the others are the
     // `len` bytes of `to`.
-    unsafe { _mm512_mask_storeu_epi8(to.as_mut_ptr().cast(), low_bits(to.len()), _mm512_setzero_si512()) };
+    unsafe {
+        _mm512_mask_storeu_epi8(
+            to.as_mut_ptr().cast(),
+            low_bits(to.len()),
+            _mm512_setzero_si512(),
+        )
+    };
 }
 
 /// Returns a mask of the lowest `len` bits.
@@ -114,13 +122,20 @@ fn low_bits(len: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MIN_ZERO_RUN;
     use crate::decompress::decompress as scalar_decompress;
     use crate::leb128;
-    use crate::testutil::{Guarded, Rng, reference_compressed, require_avx512, sparse};
+    use crate::testutil::{
+        Guarded, MIN_ZERO_RUNS, Rng, reference_compressed, require_avx512, sparse,
+    };
 
     /// Runs both decoders on `src` into `dst_len` bytes of garbage, and checks they agree on
     /// the result and on every byte of `dst`, including on an error.
-    fn assert_matches_scalar(src: &[u8], dst_len: usize, what: &str) -> Result<Vec<u8>, DecompressError> {
+    fn assert_matches_scalar(
+        src: &[u8],
+        dst_len: usize,
+        what: &str,
+    ) -> Result<Vec<u8>, DecompressError> {
         require_avx512();
         let mut scalar_dst = vec![0xcc; dst_len];
         let scalar_result = scalar_decompress(src, &mut scalar_dst);
@@ -136,9 +151,14 @@ mod tests {
     fn t1_round_trips_and_matches_scalar() {
         let mut rng = Rng::new(4);
         for case in 0..500 {
-            let src = sparse(&mut rng, 2000);
-            let packed = reference_compressed(&src);
-            assert_eq!(assert_matches_scalar(&packed, src.len(), &format!("case {case}")), Ok(src));
+            // Every minimum in turn: a longer one leaves short runs inside long literals.
+            let min_zero_run = MIN_ZERO_RUNS[case % MIN_ZERO_RUNS.len()];
+            let src = sparse(&mut rng, 2000, min_zero_run);
+            let packed = reference_compressed(&src, min_zero_run);
+            assert_eq!(
+                assert_matches_scalar(&packed, src.len(), &format!("case {case}")),
+                Ok(src)
+            );
         }
     }
 
@@ -150,7 +170,7 @@ mod tests {
                 let mut src = vec![0x77u8; literal_len];
                 src.extend(std::iter::repeat_n(0, zero_len));
                 src.push(1);
-                let packed = reference_compressed(&src);
+                let packed = reference_compressed(&src, MIN_ZERO_RUN);
                 let what = format!("{literal_len} literal, {zero_len} zeros");
                 assert_eq!(assert_matches_scalar(&packed, src.len(), &what), Ok(src));
             }
@@ -176,7 +196,10 @@ mod tests {
             (overflow, 10, DecompressError::LengthOverflow),
             (huge, 10, DecompressError::DstTooSmall),
         ] {
-            assert_eq!(assert_matches_scalar(&src, dst_len, &format!("{src:02x?}")), Err(expected));
+            assert_eq!(
+                assert_matches_scalar(&src, dst_len, &format!("{src:02x?}")),
+                Err(expected)
+            );
         }
     }
 
@@ -186,7 +209,7 @@ mod tests {
         src.extend([0; 300]);
         src.extend([6u8; 20]);
         src.extend([0; 10]);
-        let packed = reference_compressed(&src);
+        let packed = reference_compressed(&src, MIN_ZERO_RUN);
         for cut in 0..packed.len() {
             let _ = assert_matches_scalar(&packed[..cut], src.len(), &format!("cut at {cut}"));
         }
@@ -203,13 +226,17 @@ mod tests {
             for zero_len in [0, 3, 40, 64, 70] {
                 let mut original = vec![0x42u8; literal_len];
                 original.extend(std::iter::repeat_n(0, zero_len));
-                let packed = reference_compressed(&original);
+                let packed = reference_compressed(&original, MIN_ZERO_RUN);
                 let src = guarded_src.tail(packed.len());
                 src.copy_from_slice(&packed);
                 let dst = guarded_dst.tail(original.len());
                 // SAFETY: require_avx512 checked the CPU has AVX-512F, BW and BMI2.
                 let result = unsafe { decompress(src, dst) };
-                assert_eq!(result, Ok(original.len()), "{literal_len} literal, {zero_len} zeros");
+                assert_eq!(
+                    result,
+                    Ok(original.len()),
+                    "{literal_len} literal, {zero_len} zeros"
+                );
                 assert_eq!(dst, &original[..]);
             }
         }

@@ -96,7 +96,10 @@ pub fn get(input: &[u8]) -> Result<Decoded, GetError> {
         value |= group << shift;
         // The top bit says another byte follows.
         if byte & 0x80 == 0 {
-            return Ok(Decoded { value, len: byte_index + 1 });
+            return Ok(Decoded {
+                value,
+                len: byte_index + 1,
+            });
         }
     }
     Err(GetError::Truncated)
@@ -139,7 +142,11 @@ mod tests {
             (u64::MAX, 10),
         ] {
             assert_eq!(len(value), bytes, "len({value})");
-            assert_eq!(encoded(value).len(), bytes, "put({value}) must write len({value}) bytes");
+            assert_eq!(
+                encoded(value).len(),
+                bytes,
+                "put({value}) must write len({value}) bytes"
+            );
         }
     }
 
@@ -154,7 +161,18 @@ mod tests {
 
     #[test]
     fn t5_get_reads_what_put_wrote() {
-        for value in [0, 1, 127, 128, 300, 16_383, 16_384, 1 << 49, u64::MAX - 1, u64::MAX] {
+        for value in [
+            0,
+            1,
+            127,
+            128,
+            300,
+            16_383,
+            16_384,
+            1 << 49,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
             let mut bytes = encoded(value);
             let len = bytes.len();
             bytes.push(0xee); // a trailing byte get must not read
