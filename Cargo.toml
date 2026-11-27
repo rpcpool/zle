@@ -6,7 +6,7 @@ edition = "2024"
 rust-version = "1.89"
 authors = ["Louis-Vincent <louis-vincent@triton.one>"]
 readme = "README.md"
-publish = false
+publish = true
 license = "(MIT OR Apache-2.0) AND Apache-2.0"
 description = "Zero-length encoding: drops runs of zero bytes, with an AVX-512 compressor and decompressor."
 
