@@ -59,10 +59,17 @@
 //!
 //! # CPU support
 //!
-//! Every function uses AVX-512 when the CPU has AVX-512F, AVX-512BW and BMI2, and scalar code
-//! otherwise; both write the same bytes. A build with those features enabled
-//! (`-C target-cpu=x86-64-v4`) calls AVX-512 directly. Other x86_64 builds check the CPU once
-//! per call, and other architectures use the scalar code.
+//! **Run on a CPU with AVX-512, whichever function you pick.** Compress plus decompress is
+//! faster with AVX-512 for every recommended call: 1.07× for [`compress`], 1.7× for
+//! [`compress_with_min_run`]`(src, dst, 16)`, 1.3× for [`compress_aligned`]`(src, dst, 2)`.
+//! The one step where it is not ahead: on data shaped like Solana accounts, [`compress`]
+//! alone compresses about 10% slower with AVX-512, but its output decompresses 1.5× faster.
+//! On data whose zeros come in fewer, longer runs, AVX-512 compresses faster too.
+//!
+//! Every function uses AVX-512 by itself when the CPU has AVX-512F, AVX-512BW and BMI2, and
+//! scalar code otherwise; both write the same bytes. A build with those features enabled
+//! (`RUSTFLAGS="-C target-cpu=x86-64-v4"`) calls AVX-512 directly. Other x86_64 builds check
+//! the CPU once per call, and other architectures use the scalar code.
 //!
 //! # Format
 //!
