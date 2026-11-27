@@ -1,8 +1,9 @@
 //! The vector operations the AVX-512 compressor is built from.
 //!
 //! [`or3`] and [`is_zero_256`] are derived from Richard Patel's zle
-//! (<https://github.com/riptl/zle>, `ZLE_OR3V` and `zle_nz_256` in `lib/zle.c`), under the
-//! BSD 3-Clause License: see `LICENSE-BSD-3-Clause` at the crate's root.
+//! (<https://github.com/riptl/zle>, `ZLE_OR3V` and `zle_nz_256` in `lib/zle.c`), Copyright
+//! (c) 2026 Richard Patel, licensed under the Apache License, Version 2.0 (`LICENSE-APACHE`
+//! at the crate's root). They were translated to Rust and modified for this crate.
 
 use std::arch::x86_64::*;
 

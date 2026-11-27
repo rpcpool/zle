@@ -285,10 +285,10 @@ Licensed under either of
   <https://www.apache.org/licenses/LICENSE-2.0>)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
-at your option, except for the parts derived from Richard Patel's zle, which are under the
-BSD 3-Clause License ([LICENSE-BSD-3-Clause](LICENSE-BSD-3-Clause)): the vector helpers
-`or3` and `is_zero_256` in `src/avx512/ops.rs`, and the masked copy and zero helpers in
-`src/avx512/decompress.rs`.
+at your option, except for the parts derived from Richard Patel's
+[zle](https://github.com/riptl/zle), Copyright (c) 2026 Richard Patel, which are under the
+Apache License, Version 2.0 only: the vector helpers `or3` and `is_zero_256` in
+`src/avx512/ops.rs`, and the masked copy and zero helpers in `src/avx512/decompress.rs`.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for
 inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed
